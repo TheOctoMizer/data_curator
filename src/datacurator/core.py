@@ -10,6 +10,8 @@ import math
 import random
 from typing import Any
 
+import torch
+
 
 @dataclass(slots=True)
 class LoadedModel:
@@ -65,7 +67,7 @@ class CurriculumSchedule:
         return _normalize_weights(points[-1][1])
 
 
-class CurriculumIterableDataset:
+class CurriculumIterableDataset(torch.utils.data.IterableDataset):
     """Iterable dataset that samples easy/medium/hard with dynamic curriculum weights."""
 
     def __init__(
@@ -120,6 +122,10 @@ class CurriculumIterableDataset:
                 "difficulty_label": chosen_label,
                 "perplexity": float(row.get("perplexity", 0.0)),
             }
+
+    def __len__(self) -> int:
+        """Return planned number of curriculum sampling steps."""
+        return self.total_steps
 
 
 class DataCurator:
