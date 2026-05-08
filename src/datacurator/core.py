@@ -1,8 +1,437 @@
 """Core module API for DataCurator."""
 
+from __future__ import annotations
+
+from collections.abc import Iterator
+from dataclasses import dataclass
+import logging
+import math
+from typing import Any
+
+
+@dataclass(slots=True)
+class LoadedModel:
+    """Container for a loaded text-generation model and tokenizer."""
+
+    model: Any
+    tokenizer: Any
+    model_id: str
+    quantization: str
+    device: str
+
+
 class DataCurator:
-    """Basic library object users can import and use."""
+    """Library object for loading and streaming Hugging Face datasets."""
+
+    def __init__(
+        self,
+        *,
+        log_level: int = logging.INFO,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        """Initialize DataCurator with structured logging."""
+        self.logger = logger or logging.getLogger("datacurator")
+        self.logger.setLevel(log_level)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
+                )
+            )
+            self.logger.addHandler(handler)
+        self.logger.propagate = False
 
     def describe(self) -> str:
         """Describe this library instance."""
-        return "DataCurator is a library for curating data."
+        return "DataCurator helps load and stream datasets from Hugging Face."
+
+    def load_dataset(
+        self,
+        repo_id: str,
+        *,
+        config: str | None = None,
+        split: str | None = None,
+        streaming: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Load a dataset from Hugging Face Hub.
+
+        Args:
+            repo_id: Hugging Face dataset id, e.g. ``"imdb"``.
+            config: Optional dataset config/subset name.
+            split: Optional split like ``"train"`` or ``"test"``.
+            streaming: If true, stream data instead of downloading locally.
+            **kwargs: Extra keyword args passed to ``datasets.load_dataset``.
+        """
+        datasets = _import_datasets_module()
+        self.logger.info(
+            "Loading dataset repo_id=%s config=%s split=%s streaming=%s",
+            repo_id,
+            config,
+            split,
+            streaming,
+        )
+        try:
+            dataset = datasets.load_dataset(
+                path=repo_id,
+                name=config,
+                split=split,
+                streaming=streaming,
+                **kwargs,
+            )
+            self.logger.info("Dataset loaded successfully: %s", repo_id)
+            return dataset
+        except Exception as exc:
+            self.logger.exception("Dataset load failed for repo_id=%s", repo_id)
+            raise RuntimeError(
+                "Failed to load dataset from Hugging Face Hub. "
+                "Check network/proxy access and authentication (HF_TOKEN) if needed."
+            ) from exc
+
+    def stream_dataset(
+        self,
+        repo_id: str,
+        *,
+        config: str | None = None,
+        split: str = "train",
+        **kwargs: Any,
+    ) -> Any:
+        """Stream a dataset split from Hugging Face without full download."""
+        self.logger.info(
+            "Streaming dataset repo_id=%s config=%s split=%s",
+            repo_id,
+            config,
+            split,
+        )
+        return self.load_dataset(
+            repo_id=repo_id,
+            config=config,
+            split=split,
+            streaming=True,
+            **kwargs,
+        )
+
+    def iter_rows(
+        self,
+        dataset: Any,
+        *,
+        limit: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Iterate rows from a loaded or streaming Hugging Face dataset."""
+        for index, row in enumerate(dataset):
+            if limit is not None and index >= limit:
+                break
+            yield row
+
+    def load_model(
+        self,
+        *,
+        model_id: str = "Qwen/Qwen2.5-0.5B-Instruct",
+        trust_remote_code: bool = False,
+        **kwargs: Any,
+    ) -> LoadedModel:
+        """Load a causal LM with an efficiency-first default model.
+
+        Strategy:
+        - CUDA + bitsandbytes: 4-bit NF4 quantization (best efficiency).
+        - Otherwise: float16/bfloat16 fallback with automatic device mapping.
+        """
+        torch = _import_torch_module()
+        transformers = _import_transformers_module()
+        self.logger.info("Loading model model_id=%s", model_id)
+
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+        )
+
+        model_kwargs: dict[str, Any] = {
+            "trust_remote_code": trust_remote_code,
+            "low_cpu_mem_usage": True,
+            "device_map": "auto",
+        }
+        model_kwargs.update(kwargs)
+
+        quantization = "none"
+        device = "cpu"
+
+        if torch.cuda.is_available():
+            device = "cuda"
+            model_kwargs.setdefault("torch_dtype", torch.float16)
+            if _has_bitsandbytes():
+                model_kwargs["quantization_config"] = transformers.BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                )
+                quantization = "4bit-nf4"
+            else:
+                quantization = "fp16"
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            device = "mps"
+            model_kwargs.setdefault("torch_dtype", torch.float16)
+            quantization = "fp16"
+        else:
+            device = "cpu"
+            model_kwargs.setdefault("torch_dtype", torch.float32)
+            quantization = "fp32"
+
+        try:
+            model = transformers.AutoModelForCausalLM.from_pretrained(
+                model_id,
+                **model_kwargs,
+            )
+        except Exception as exc:
+            self.logger.exception("Model load failed for model_id=%s", model_id)
+            raise RuntimeError(
+                "Failed to load model from Hugging Face Hub. Check model id, "
+                "network/proxy configuration, and authentication (HF_TOKEN) if needed."
+            ) from exc
+
+        self.logger.info(
+            "Model loaded model_id=%s device=%s quantization=%s",
+            model_id,
+            device,
+            quantization,
+        )
+        return LoadedModel(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            quantization=quantization,
+            device=device,
+        )
+
+    def stream_perplexities(
+        self,
+        dataset: Any,
+        *,
+        loaded_model: LoadedModel,
+        text_key: str = "text",
+        limit: int | None = None,
+        max_length: int = 512,
+        show_progress: bool = True,
+        progress_desc: str = "Computing perplexity",
+        log_every: int = 100,
+        medium_threshold: float = 20.0,
+        hard_threshold: float = 60.0,
+    ) -> Iterator[dict[str, Any]]:
+        """Stream rows and compute perplexity per record.
+
+        Yields dictionaries containing:
+        - index: row index in the processed stream
+        - text: the evaluated text
+        - perplexity: float perplexity value
+        - difficulty_score: normalized score in [0.0, 1.0]
+        - difficulty_label: easy/medium/hard
+        - record: original row dict
+        """
+        torch = _import_torch_module()
+        tqdm = _import_tqdm()
+
+        model = loaded_model.model
+        tokenizer = loaded_model.tokenizer
+
+        self.logger.info(
+            "Starting perplexity stream model_id=%s text_key=%s limit=%s max_length=%s medium_threshold=%.3f hard_threshold=%.3f",
+            loaded_model.model_id,
+            text_key,
+            limit,
+            max_length,
+            medium_threshold,
+            hard_threshold,
+        )
+
+        model.eval()
+        row_iterator = self.iter_rows(dataset, limit=limit)
+        if show_progress:
+            row_iterator = tqdm(row_iterator, total=limit, desc=progress_desc)
+
+        for index, row in enumerate(row_iterator):
+            if text_key not in row:
+                self.logger.debug("Skipping row index=%s missing key=%s", index, text_key)
+                continue
+
+            text = row[text_key]
+            if not isinstance(text, str) or not text.strip():
+                self.logger.debug("Skipping row index=%s empty/non-string text", index)
+                continue
+
+            perplexity = self._compute_perplexity_for_text(
+                text=text,
+                model=model,
+                tokenizer=tokenizer,
+                max_length=max_length,
+            )
+            difficulty = self.difficulty_from_perplexity(
+                perplexity,
+                medium_threshold=medium_threshold,
+                hard_threshold=hard_threshold,
+            )
+
+            if index % max(1, log_every) == 0:
+                self.logger.info(
+                    "Processed row index=%s perplexity=%.4f difficulty=%s score=%.3f",
+                    index,
+                    perplexity,
+                    difficulty["label"],
+                    difficulty["score"],
+                )
+
+            yield {
+                "index": index,
+                "text": text,
+                "perplexity": perplexity,
+                "difficulty_score": difficulty["score"],
+                "difficulty_label": difficulty["label"],
+                "record": row,
+            }
+
+        self.logger.info("Completed perplexity streaming run")
+
+    def _compute_perplexity_for_text(
+        self,
+        *,
+        text: str,
+        model: Any,
+        tokenizer: Any,
+        max_length: int,
+    ) -> float:
+        """Compute perplexity for one text input."""
+        torch = _import_torch_module()
+
+        encoded = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+        )
+        encoded = _move_batch_to_model_device(encoded=encoded, model=model)
+        labels = encoded["input_ids"].clone()
+
+        with torch.no_grad():
+            outputs = model(**encoded, labels=labels)
+            loss = outputs.loss
+            ppl = torch.exp(loss).item()
+
+        if math.isinf(ppl) or math.isnan(ppl):
+            self.logger.warning("Perplexity is invalid for one record; returning inf")
+            return float("inf")
+        return float(ppl)
+
+    def difficulty_from_perplexity(
+        self,
+        perplexity: float,
+        *,
+        medium_threshold: float = 20.0,
+        hard_threshold: float = 60.0,
+    ) -> dict[str, Any]:
+        """Convert perplexity to a user-facing difficulty score and label."""
+        if medium_threshold <= 0 or hard_threshold <= 0:
+            raise ValueError("Difficulty thresholds must be positive values.")
+        if hard_threshold <= medium_threshold:
+            raise ValueError("hard_threshold must be greater than medium_threshold.")
+
+        if math.isinf(perplexity) or math.isnan(perplexity):
+            return {"score": 1.0, "label": "hard"}
+
+        # Normalize using a capped linear scale up to the hard threshold.
+        score = max(0.0, min(1.0, perplexity / hard_threshold))
+        if perplexity < medium_threshold:
+            label = "easy"
+        elif perplexity < hard_threshold:
+            label = "medium"
+        else:
+            label = "hard"
+        return {"score": score, "label": label}
+
+    def load_qwen25_05b(
+        self,
+        *,
+        model_id: str = "Qwen/Qwen2.5-0.5B-Instruct",
+        trust_remote_code: bool = False,
+        **kwargs: Any,
+    ) -> LoadedModel:
+        """Backward-compatible alias for loading Qwen2.5-0.5B."""
+        return self.load_model(
+            model_id=model_id,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+
+
+def _import_datasets_module() -> Any:
+    """Import datasets lazily to keep import-time overhead low."""
+    try:
+        import datasets
+    except ImportError as exc:
+        raise ImportError(
+            "The 'datasets' package is required. Install with `pip install datasets`."
+        ) from exc
+    return datasets
+
+
+def _import_torch_module() -> Any:
+    """Import torch lazily for model loading APIs."""
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError(
+            "The 'torch' package is required for model loading. "
+            "Install with `pip install torch`."
+        ) from exc
+    return torch
+
+
+def _import_transformers_module() -> Any:
+    """Import transformers lazily for model loading APIs."""
+    try:
+        import transformers
+    except ImportError as exc:
+        raise ImportError(
+            "The 'transformers' package is required for model loading. "
+            "Install with `pip install transformers`."
+        ) from exc
+    return transformers
+
+
+def _has_bitsandbytes() -> bool:
+    """Check if bitsandbytes is available for 4-bit/8-bit quantization."""
+    try:
+        import bitsandbytes  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _import_tqdm() -> Any:
+    """Import tqdm with a clear dependency message."""
+    try:
+        from tqdm.auto import tqdm
+    except ImportError as exc:
+        raise ImportError(
+            "The 'tqdm' package is required for progress bars. "
+            "Install with `pip install tqdm`."
+        ) from exc
+    return tqdm
+
+
+def _move_batch_to_model_device(*, encoded: dict[str, Any], model: Any) -> dict[str, Any]:
+    """Move tokenized inputs to an appropriate model device when possible."""
+    # If model is sharded (device_map='auto'), accelerate handles placement.
+    if hasattr(model, "hf_device_map"):
+        return encoded
+
+    model_device = getattr(model, "device", None)
+    if model_device is None:
+        return encoded
+
+    moved: dict[str, Any] = {}
+    for key, value in encoded.items():
+        if hasattr(value, "to"):
+            moved[key] = value.to(model_device)
+        else:
+            moved[key] = value
+    return moved

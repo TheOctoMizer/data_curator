@@ -4,7 +4,13 @@ version = "0.1.0"
 description = "DataCurator Python library"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "datasets>=4.8.5",
+    "torch>=2.3",
+    "transformers>=4.45",
+    "accelerate>=0.34",
+    "tqdm>=4.66",
+]
 
 [build-system]
 requires = ["hatchling"]
