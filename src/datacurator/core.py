@@ -326,6 +326,10 @@ class DataCurator:
         log_every: int = 100,
         medium_threshold: float = 20.0,
         hard_threshold: float = 60.0,
+        batch_size: int | None = None,
+        min_batch_size: int = 1,
+        max_batch_size: int = 32,
+        oom_backoff_factor: float = 0.5,
     ) -> Iterator[dict[str, Any]]:
         """Stream rows and compute perplexity per record.
 
@@ -337,20 +341,30 @@ class DataCurator:
         - difficulty_label: easy/medium/hard
         - record: original row dict
         """
-        torch = _import_torch_module()
         tqdm = _import_tqdm()
 
         model = loaded_model.model
         tokenizer = loaded_model.tokenizer
+        current_batch_size = (
+            batch_size
+            if batch_size is not None
+            else self._default_perplexity_batch_size(
+                loaded_model.device, max_batch_size=max_batch_size
+            )
+        )
+        current_batch_size = max(min_batch_size, min(max_batch_size, current_batch_size))
 
         self.logger.info(
-            "Starting perplexity stream model_id=%s text_key=%s limit=%s max_length=%s medium_threshold=%.3f hard_threshold=%.3f",
+            "Starting perplexity stream model_id=%s text_key=%s limit=%s max_length=%s medium_threshold=%.3f hard_threshold=%.3f batch_size=%s min_batch_size=%s max_batch_size=%s",
             loaded_model.model_id,
             text_key,
             limit,
             max_length,
             medium_threshold,
             hard_threshold,
+            current_batch_size,
+            min_batch_size,
+            max_batch_size,
         )
 
         model.eval()
@@ -358,6 +372,8 @@ class DataCurator:
         if show_progress:
             row_iterator = tqdm(row_iterator, total=limit, desc=progress_desc)
 
+        pending: list[tuple[int, dict[str, Any], str]] = []
+        processed = 0
         for index, row in enumerate(row_iterator):
             if text_key not in row:
                 self.logger.debug("Skipping row index=%s missing key=%s", index, text_key)
@@ -368,67 +384,189 @@ class DataCurator:
                 self.logger.debug("Skipping row index=%s empty/non-string text", index)
                 continue
 
-            perplexity = self._compute_perplexity_for_text(
-                text=text,
+            pending.append((index, row, text))
+            if len(pending) < current_batch_size:
+                continue
+            perplexities, current_batch_size = self._compute_perplexity_batch_with_backoff(
+                texts=[item[2] for item in pending],
                 model=model,
                 tokenizer=tokenizer,
                 max_length=max_length,
+                initial_batch_size=current_batch_size,
+                min_batch_size=min_batch_size,
+                max_batch_size=max_batch_size,
+                oom_backoff_factor=oom_backoff_factor,
             )
-            difficulty = self.difficulty_from_perplexity(
-                perplexity,
-                medium_threshold=medium_threshold,
-                hard_threshold=hard_threshold,
+            for (p_index, p_row, p_text), perplexity in zip(pending, perplexities):
+                difficulty = self.difficulty_from_perplexity(
+                    perplexity,
+                    medium_threshold=medium_threshold,
+                    hard_threshold=hard_threshold,
+                )
+                processed += 1
+                # if processed % max(1, log_every) == 0:
+                    # self.logger.info(
+                    #     "Processed rows=%s latest_index=%s perplexity=%.4f difficulty=%s score=%.3f batch_size=%s",
+                    #     processed,
+                    #     p_index,
+                    #     perplexity,
+                    #     difficulty["label"],
+                    #     difficulty["score"],
+                    #     current_batch_size,
+                    # )
+                yield {
+                    "index": p_index,
+                    "text": p_text,
+                    "perplexity": perplexity,
+                    "difficulty_score": difficulty["score"],
+                    "difficulty_label": difficulty["label"],
+                    "record": p_row,
+                }
+            pending = []
+
+        if pending:
+            perplexities, current_batch_size = self._compute_perplexity_batch_with_backoff(
+                texts=[item[2] for item in pending],
+                model=model,
+                tokenizer=tokenizer,
+                max_length=max_length,
+                initial_batch_size=current_batch_size,
+                min_batch_size=min_batch_size,
+                max_batch_size=max_batch_size,
+                oom_backoff_factor=oom_backoff_factor,
             )
-
-            # if index % max(1, log_every) == 0:
-            #     self.logger.info(
-            #         "Processed row index=%s perplexity=%.4f difficulty=%s score=%.3f",
-            #         index,
-            #         perplexity,
-            #         difficulty["label"],
-            #         difficulty["score"],
-            #     )
-
-            yield {
-                "index": index,
-                "text": text,
-                "perplexity": perplexity,
-                "difficulty_score": difficulty["score"],
-                "difficulty_label": difficulty["label"],
-                "record": row,
-            }
+            for (p_index, p_row, p_text), perplexity in zip(pending, perplexities):
+                difficulty = self.difficulty_from_perplexity(
+                    perplexity,
+                    medium_threshold=medium_threshold,
+                    hard_threshold=hard_threshold,
+                )
+                processed += 1
+                yield {
+                    "index": p_index,
+                    "text": p_text,
+                    "perplexity": perplexity,
+                    "difficulty_score": difficulty["score"],
+                    "difficulty_label": difficulty["label"],
+                    "record": p_row,
+                }
 
         self.logger.info("Completed perplexity streaming run")
 
-    def _compute_perplexity_for_text(
+    def _compute_perplexity_batch_with_backoff(
         self,
         *,
-        text: str,
+        texts: list[str],
         model: Any,
         tokenizer: Any,
         max_length: int,
-    ) -> float:
-        """Compute perplexity for one text input."""
+        initial_batch_size: int,
+        min_batch_size: int,
+        max_batch_size: int,
+        oom_backoff_factor: float,
+    ) -> tuple[list[float], int]:
+        """Compute perplexities for texts with adaptive memory-aware micro-batching."""
         torch = _import_torch_module()
+        results: list[float] = []
+        current_batch_size = max(min_batch_size, min(max_batch_size, initial_batch_size))
+        position = 0
 
+        while position < len(texts):
+            end = min(position + current_batch_size, len(texts))
+            chunk = texts[position:end]
+            try:
+                chunk_results = self._compute_perplexity_batch(
+                    texts=chunk,
+                    model=model,
+                    tokenizer=tokenizer,
+                    max_length=max_length,
+                )
+                results.extend(chunk_results)
+                position = end
+            except RuntimeError as exc:
+                if not _is_oom_error(exc):
+                    raise
+                if current_batch_size <= min_batch_size:
+                    raise RuntimeError(
+                        "Perplexity batch failed even at minimum batch size. "
+                        "Reduce max_length or use a smaller scoring model."
+                    ) from exc
+                next_batch_size = max(
+                    min_batch_size, int(current_batch_size * oom_backoff_factor)
+                )
+                if next_batch_size >= current_batch_size:
+                    next_batch_size = current_batch_size - 1
+                self.logger.warning(
+                    "OOM during perplexity scoring; reducing batch_size from %s to %s",
+                    current_batch_size,
+                    next_batch_size,
+                )
+                current_batch_size = max(min_batch_size, next_batch_size)
+                _clear_torch_cache(torch=torch)
+
+        return results, current_batch_size
+
+    def _compute_perplexity_batch(
+        self,
+        *,
+        texts: list[str],
+        model: Any,
+        tokenizer: Any,
+        max_length: int,
+    ) -> list[float]:
+        """Compute per-record perplexities for a batch of texts."""
+        torch = _import_torch_module()
         encoded = tokenizer(
-            text,
+            texts,
             return_tensors="pt",
             truncation=True,
+            padding=True,
             max_length=max_length,
         )
         encoded = _move_batch_to_model_device(encoded=encoded, model=model)
-        labels = encoded["input_ids"].clone()
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
 
-        with torch.no_grad():
-            outputs = model(**encoded, labels=labels)
-            loss = outputs.loss
-            ppl = torch.exp(loss).item()
+        # Next-token prediction labels for causal LM.
+        shift_labels = input_ids[:, 1:].contiguous()
+        shift_mask = attention_mask[:, 1:].contiguous()
 
-        if math.isinf(ppl) or math.isnan(ppl):
-            self.logger.warning("Perplexity is invalid for one record; returning inf")
-            return float("inf")
-        return float(ppl)
+        with torch.inference_mode():
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            logits = outputs.logits[:, :-1, :].contiguous()
+            log_probs = torch.log_softmax(logits, dim=-1)
+            token_log_probs = log_probs.gather(
+                dim=-1, index=shift_labels.unsqueeze(-1)
+            ).squeeze(-1)
+
+            neg_log_likelihood = -(token_log_probs * shift_mask).sum(dim=1)
+            token_counts = shift_mask.sum(dim=1).clamp(min=1)
+            avg_nll = neg_log_likelihood / token_counts
+            perplexities = torch.exp(avg_nll).detach().float().cpu().tolist()
+
+        normalized: list[float] = []
+        for ppl in perplexities:
+            if math.isinf(ppl) or math.isnan(ppl):
+                normalized.append(float("inf"))
+            else:
+                normalized.append(float(ppl))
+        return normalized
+
+    def _default_perplexity_batch_size(
+        self,
+        device: str,
+        *,
+        max_batch_size: int,
+    ) -> int:
+        """Pick a conservative default batch size by device."""
+        if device == "cuda":
+            return min(max_batch_size, 32)
+        if device == "mps":
+            return min(max_batch_size, 16)
+        return min(max_batch_size, 4)
 
     def difficulty_from_perplexity(
         self,
@@ -483,6 +621,10 @@ class DataCurator:
         log_every: int = 100,
         medium_threshold: float = 20.0,
         hard_threshold: float = 60.0,
+        perplexity_batch_size: int | None = None,
+        min_perplexity_batch_size: int = 1,
+        max_perplexity_batch_size: int = 32,
+        oom_backoff_factor: float = 0.5,
         unload_source_dataset: bool = True,
         unload_model_after: bool = False,
     ) -> Any:
@@ -514,6 +656,10 @@ class DataCurator:
             log_every=log_every,
             medium_threshold=medium_threshold,
             hard_threshold=hard_threshold,
+            batch_size=perplexity_batch_size,
+            min_batch_size=min_perplexity_batch_size,
+            max_batch_size=max_perplexity_batch_size,
+            oom_backoff_factor=oom_backoff_factor,
         ):
             new_row = dict(result["record"])
             new_row["perplexity"] = result["perplexity"]
@@ -817,3 +963,17 @@ def _collate_curriculum_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "difficulty_label": [item["difficulty_label"] for item in batch],
         "perplexity": [item["perplexity"] for item in batch],
     }
+
+
+def _is_oom_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return "out of memory" in message or "oom" in message
+
+
+def _clear_torch_cache(*, torch: Any) -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        if hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
