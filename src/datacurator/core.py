@@ -330,6 +330,9 @@ class DataCurator:
         min_batch_size: int = 1,
         max_batch_size: int = 32,
         oom_backoff_factor: float = 0.5,
+        auto_grow_batch_size: bool = True,
+        growth_factor: float = 1.25,
+        growth_interval_successes: int = 3,
     ) -> Iterator[dict[str, Any]]:
         """Stream rows and compute perplexity per record.
 
@@ -353,9 +356,10 @@ class DataCurator:
             )
         )
         current_batch_size = max(min_batch_size, min(max_batch_size, current_batch_size))
+        success_streak = 0
 
         self.logger.info(
-            "Starting perplexity stream model_id=%s text_key=%s limit=%s max_length=%s medium_threshold=%.3f hard_threshold=%.3f batch_size=%s min_batch_size=%s max_batch_size=%s",
+            "Starting perplexity stream model_id=%s text_key=%s limit=%s max_length=%s medium_threshold=%.3f hard_threshold=%.3f batch_size=%s min_batch_size=%s max_batch_size=%s auto_grow=%s growth_factor=%.2f growth_interval=%s",
             loaded_model.model_id,
             text_key,
             limit,
@@ -365,6 +369,9 @@ class DataCurator:
             current_batch_size,
             min_batch_size,
             max_batch_size,
+            auto_grow_batch_size,
+            growth_factor,
+            growth_interval_successes,
         )
 
         model.eval()
@@ -387,6 +394,7 @@ class DataCurator:
             pending.append((index, row, text))
             if len(pending) < current_batch_size:
                 continue
+            old_batch_size = current_batch_size
             perplexities, current_batch_size = self._compute_perplexity_batch_with_backoff(
                 texts=[item[2] for item in pending],
                 model=model,
@@ -397,6 +405,28 @@ class DataCurator:
                 max_batch_size=max_batch_size,
                 oom_backoff_factor=oom_backoff_factor,
             )
+            if current_batch_size < old_batch_size:
+                success_streak = 0
+            else:
+                success_streak += 1
+                if (
+                    auto_grow_batch_size
+                    and current_batch_size < max_batch_size
+                    and success_streak >= max(1, growth_interval_successes)
+                ):
+                    next_batch_size = min(
+                        max_batch_size,
+                        max(current_batch_size + 1, int(current_batch_size * growth_factor)),
+                    )
+                    if next_batch_size > current_batch_size:
+                        self.logger.info(
+                            "Increasing perplexity batch_size from %s to %s after %s stable chunk(s)",
+                            current_batch_size,
+                            next_batch_size,
+                            success_streak,
+                        )
+                        current_batch_size = next_batch_size
+                    success_streak = 0
             for (p_index, p_row, p_text), perplexity in zip(pending, perplexities):
                 difficulty = self.difficulty_from_perplexity(
                     perplexity,
@@ -425,6 +455,7 @@ class DataCurator:
             pending = []
 
         if pending:
+            old_batch_size = current_batch_size
             perplexities, current_batch_size = self._compute_perplexity_batch_with_backoff(
                 texts=[item[2] for item in pending],
                 model=model,
@@ -435,6 +466,10 @@ class DataCurator:
                 max_batch_size=max_batch_size,
                 oom_backoff_factor=oom_backoff_factor,
             )
+            if current_batch_size < old_batch_size:
+                success_streak = 0
+            else:
+                success_streak += 1
             for (p_index, p_row, p_text), perplexity in zip(pending, perplexities):
                 difficulty = self.difficulty_from_perplexity(
                     perplexity,
@@ -625,6 +660,9 @@ class DataCurator:
         min_perplexity_batch_size: int = 1,
         max_perplexity_batch_size: int = 32,
         oom_backoff_factor: float = 0.5,
+        auto_grow_perplexity_batch_size: bool = True,
+        perplexity_growth_factor: float = 1.25,
+        perplexity_growth_interval_successes: int = 3,
         unload_source_dataset: bool = True,
         unload_model_after: bool = False,
     ) -> Any:
@@ -660,6 +698,9 @@ class DataCurator:
             min_batch_size=min_perplexity_batch_size,
             max_batch_size=max_perplexity_batch_size,
             oom_backoff_factor=oom_backoff_factor,
+            auto_grow_batch_size=auto_grow_perplexity_batch_size,
+            growth_factor=perplexity_growth_factor,
+            growth_interval_successes=perplexity_growth_interval_successes,
         ):
             new_row = dict(result["record"])
             new_row["perplexity"] = result["perplexity"]

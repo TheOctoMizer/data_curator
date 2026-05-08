@@ -91,6 +91,7 @@ curated = curator.create_difficulty_dataset(
     show_progress=True,
     perplexity_batch_size=None,      # auto-select by device memory
     max_perplexity_batch_size=32,    # upper bound for adaptive batching
+    auto_grow_perplexity_batch_size=True,  # probe upward after stable chunks
     unload_source_dataset=True,  # drop old dataset refs
     unload_model_after=True,     # optional model cleanup
 )
@@ -100,7 +101,10 @@ print(curated[0]["difficulty_label"], curated[0]["perplexity"])
 
 Perplexity speedup:
 - Adaptive batch scoring is enabled by default and automatically backs off batch size on OOM.
-- Tune with `perplexity_batch_size`, `min_perplexity_batch_size`, and `max_perplexity_batch_size`.
+- Batch size can also auto-grow after stable chunks to better use free memory.
+- Tune with `perplexity_batch_size`, `min_perplexity_batch_size`, `max_perplexity_batch_size`,
+  `auto_grow_perplexity_batch_size`, `perplexity_growth_factor`, and
+  `perplexity_growth_interval_successes`.
 
 Split and curriculum sampling (library-managed):
 
