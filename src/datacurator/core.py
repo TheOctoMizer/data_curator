@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+import gc
 import logging
 import math
 from typing import Any
@@ -360,6 +361,106 @@ class DataCurator:
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
+
+    def create_difficulty_dataset(
+        self,
+        dataset: Any,
+        *,
+        loaded_model: LoadedModel,
+        text_key: str = "text",
+        limit: int | None = None,
+        max_length: int = 512,
+        show_progress: bool = True,
+        progress_desc: str = "Computing perplexity",
+        log_every: int = 100,
+        medium_threshold: float = 20.0,
+        hard_threshold: float = 60.0,
+        unload_source_dataset: bool = True,
+        unload_model_after: bool = False,
+    ) -> Any:
+        """Build a new dataset with perplexity and difficulty classes.
+
+        Returns a Hugging Face ``datasets.Dataset`` with added columns:
+        ``perplexity``, ``difficulty_score``, and ``difficulty_label``.
+        """
+        datasets = _import_datasets_module()
+        self.logger.info(
+            "Creating difficulty dataset text_key=%s limit=%s unload_source_dataset=%s unload_model_after=%s",
+            text_key,
+            limit,
+            unload_source_dataset,
+            unload_model_after,
+        )
+
+        records: list[dict[str, Any]] = []
+        class_counts = {"easy": 0, "medium": 0, "hard": 0}
+
+        for result in self.stream_perplexities(
+            dataset,
+            loaded_model=loaded_model,
+            text_key=text_key,
+            limit=limit,
+            max_length=max_length,
+            show_progress=show_progress,
+            progress_desc=progress_desc,
+            log_every=log_every,
+            medium_threshold=medium_threshold,
+            hard_threshold=hard_threshold,
+        ):
+            new_row = dict(result["record"])
+            new_row["perplexity"] = result["perplexity"]
+            new_row["difficulty_score"] = result["difficulty_score"]
+            new_row["difficulty_label"] = result["difficulty_label"]
+            records.append(new_row)
+            class_counts[result["difficulty_label"]] += 1
+
+        curated = datasets.Dataset.from_list(records)
+        self.logger.info(
+            "Created curated dataset rows=%s easy=%s medium=%s hard=%s",
+            len(records),
+            class_counts["easy"],
+            class_counts["medium"],
+            class_counts["hard"],
+        )
+
+        if unload_source_dataset:
+            self.unload_dataset(dataset)
+        if unload_model_after:
+            self.unload_model(loaded_model)
+
+        return curated
+
+    def unload_dataset(self, dataset: Any | None) -> None:
+        """Release references to a source dataset and trigger garbage collection."""
+        if dataset is None:
+            return
+        self.logger.info("Unloading source dataset from memory")
+        del dataset
+        gc.collect()
+
+    def unload_model(self, loaded_model: LoadedModel | None) -> None:
+        """Release model/tokenizer resources and clear device caches when available."""
+        if loaded_model is None:
+            return
+        self.logger.info("Unloading model model_id=%s", loaded_model.model_id)
+
+        model = loaded_model.model
+        del loaded_model
+        del model
+        gc.collect()
+
+        try:
+            torch = _import_torch_module()
+        except ImportError:
+            return
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            self.logger.info("Cleared CUDA cache")
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            if hasattr(torch.mps, "empty_cache"):
+                torch.mps.empty_cache()
+            self.logger.info("Cleared MPS cache")
 
 
 def _import_datasets_module() -> Any:

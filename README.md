@@ -73,3 +73,25 @@ Logging:
 - Difficulty is computed from perplexity for each record:
   - `difficulty_label`: `easy`, `medium`, or `hard`
   - `difficulty_score`: normalized value in `[0.0, 1.0]`
+
+Create a new curated dataset (and unload old resources):
+
+```python
+from datacurator import DataCurator
+
+curator = DataCurator()
+source = curator.stream_dataset("wikitext", config="wikitext-2-raw-v1", split="test")
+loaded = curator.load_model()
+
+curated = curator.create_difficulty_dataset(
+    source,
+    loaded_model=loaded,
+    text_key="text",
+    limit=100,
+    show_progress=True,
+    unload_source_dataset=True,  # drop old dataset refs
+    unload_model_after=True,     # optional model cleanup
+)
+
+print(curated[0]["difficulty_label"], curated[0]["perplexity"])
+```
