@@ -159,7 +159,7 @@ class DataCurator:
 
         if torch.cuda.is_available():
             device = "cuda"
-            model_kwargs.setdefault("torch_dtype", torch.float16)
+            model_kwargs.setdefault("dtype", torch.float16)
             if _has_bitsandbytes():
                 model_kwargs["quantization_config"] = transformers.BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -172,11 +172,12 @@ class DataCurator:
                 quantization = "fp16"
         elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
             device = "mps"
-            model_kwargs.setdefault("torch_dtype", torch.float16)
-            quantization = "fp16"
+            model_kwargs.setdefault("dtype", torch.bfloat16)
+            # quantization = "fp16"
+            quantization = "bf16"
         else:
             device = "cpu"
-            model_kwargs.setdefault("torch_dtype", torch.float32)
+            model_kwargs.setdefault("dtype", torch.float32)
             quantization = "fp32"
 
         try:
@@ -272,14 +273,14 @@ class DataCurator:
                 hard_threshold=hard_threshold,
             )
 
-            if index % max(1, log_every) == 0:
-                self.logger.info(
-                    "Processed row index=%s perplexity=%.4f difficulty=%s score=%.3f",
-                    index,
-                    perplexity,
-                    difficulty["label"],
-                    difficulty["score"],
-                )
+            # if index % max(1, log_every) == 0:
+            #     self.logger.info(
+            #         "Processed row index=%s perplexity=%.4f difficulty=%s score=%.3f",
+            #         index,
+            #         perplexity,
+            #         difficulty["label"],
+            #         difficulty["score"],
+            #     )
 
             yield {
                 "index": index,
