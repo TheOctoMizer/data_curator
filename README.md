@@ -95,3 +95,34 @@ curated = curator.create_difficulty_dataset(
 
 print(curated[0]["difficulty_label"], curated[0]["perplexity"])
 ```
+
+Split and curriculum sampling (library-managed):
+
+```python
+from datacurator import CurriculumSchedule, DataCurator
+from transformers import GPT2TokenizerFast
+
+curator = DataCurator()
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token
+
+# split curated dataset with stratification by difficulty labels
+splits = curator.split_dataset(
+    curated,
+    train_ratio=0.8,
+    val_ratio=0.1,
+    test_ratio=0.1,
+    stratify_by_difficulty=True,
+)
+
+# aggressive for few epochs, gradual for many epochs automatically
+dataloader = curator.create_curriculum_dataloader(
+    splits["train"],
+    tokenizer=tokenizer,
+    total_epochs=3,      # use 300 for gradual pacing
+    steps_per_epoch=200,
+    batch_size=4,
+    max_length=128,
+    schedule=CurriculumSchedule.default(),
+)
+```

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import gc
 import logging
 import math
+import random
 from typing import Any
 
 
@@ -19,6 +20,106 @@ class LoadedModel:
     model_id: str
     quantization: str
     device: str
+
+
+@dataclass(slots=True)
+class CurriculumSchedule:
+    """Piecewise-linear curriculum schedule over training progress."""
+
+    # Each point is (progress_in_[0,1], (easy, medium, hard))
+    points: list[tuple[float, tuple[float, float, float]]]
+
+    @classmethod
+    def default(cls) -> "CurriculumSchedule":
+        return cls(
+            points=[
+                (0.0, (0.80, 0.15, 0.05)),
+                (0.5, (0.40, 0.40, 0.20)),
+                (1.0, (0.05, 0.15, 0.80)),
+            ]
+        )
+
+    def weights_at_progress(self, progress: float) -> tuple[float, float, float]:
+        """Return interpolated (easy, medium, hard) weights for progress in [0, 1]."""
+        if not self.points:
+            raise ValueError("CurriculumSchedule requires at least one point.")
+
+        p = max(0.0, min(1.0, progress))
+        points = sorted(self.points, key=lambda item: item[0])
+        if p <= points[0][0]:
+            return _normalize_weights(points[0][1])
+        if p >= points[-1][0]:
+            return _normalize_weights(points[-1][1])
+
+        for idx in range(len(points) - 1):
+            start_p, start_w = points[idx]
+            end_p, end_w = points[idx + 1]
+            if start_p <= p <= end_p:
+                alpha = 0.0 if end_p == start_p else (p - start_p) / (end_p - start_p)
+                mixed = (
+                    (1.0 - alpha) * start_w[0] + alpha * end_w[0],
+                    (1.0 - alpha) * start_w[1] + alpha * end_w[1],
+                    (1.0 - alpha) * start_w[2] + alpha * end_w[2],
+                )
+                return _normalize_weights(mixed)
+        return _normalize_weights(points[-1][1])
+
+
+class CurriculumIterableDataset:
+    """Iterable dataset that samples easy/medium/hard with dynamic curriculum weights."""
+
+    def __init__(
+        self,
+        *,
+        dataset: Any,
+        tokenizer: Any,
+        class_indices: dict[str, list[int]],
+        text_key: str,
+        total_steps: int,
+        max_length: int,
+        seed: int,
+        schedule: CurriculumSchedule,
+    ) -> None:
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.class_indices = class_indices
+        self.text_key = text_key
+        self.total_steps = max(1, total_steps)
+        self.max_length = max_length
+        self.seed = seed
+        self.schedule = schedule
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        rng = random.Random(self.seed)
+        labels = ["easy", "medium", "hard"]
+        available_labels = [label for label in labels if self.class_indices.get(label)]
+        if not available_labels:
+            raise ValueError("No samples available in curriculum class buckets.")
+
+        for step in range(self.total_steps):
+            progress = 0.0 if self.total_steps == 1 else step / (self.total_steps - 1)
+            easy_w, medium_w, hard_w = self.schedule.weights_at_progress(progress)
+            weights_map = {"easy": easy_w, "medium": medium_w, "hard": hard_w}
+            label_pool = [label for label in labels if self.class_indices.get(label)]
+            label_weights = [weights_map[label] for label in label_pool]
+            chosen_label = rng.choices(label_pool, weights=label_weights, k=1)[0]
+            row_index = rng.choice(self.class_indices[chosen_label])
+            row = self.dataset[row_index]
+
+            text = row.get(self.text_key, "")
+            encoded = self.tokenizer(
+                text,
+                truncation=True,
+                padding="max_length",
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            yield {
+                "input_ids": encoded["input_ids"].squeeze(0),
+                "attention_mask": encoded["attention_mask"].squeeze(0),
+                "difficulty_label": chosen_label,
+                "perplexity": float(row.get("perplexity", 0.0)),
+            }
 
 
 class DataCurator:
@@ -463,6 +564,147 @@ class DataCurator:
                 torch.mps.empty_cache()
             self.logger.info("Cleared MPS cache")
 
+    def split_dataset(
+        self,
+        dataset: Any,
+        *,
+        train_ratio: float = 0.8,
+        val_ratio: float = 0.1,
+        test_ratio: float = 0.1,
+        stratify_by_difficulty: bool = True,
+        seed: int = 42,
+    ) -> Any:
+        """Split curated dataset into train/val/test, optionally stratified by difficulty."""
+        datasets = _import_datasets_module()
+        total_ratio = train_ratio + val_ratio + test_ratio
+        if not math.isclose(total_ratio, 1.0, rel_tol=1e-6):
+            raise ValueError("train_ratio + val_ratio + test_ratio must equal 1.0")
+
+        total = len(dataset)
+        if total == 0:
+            raise ValueError("Cannot split an empty dataset.")
+
+        self.logger.info(
+            "Splitting dataset rows=%s train=%.2f val=%.2f test=%.2f stratified=%s",
+            total,
+            train_ratio,
+            val_ratio,
+            test_ratio,
+            stratify_by_difficulty,
+        )
+
+        rng = random.Random(seed)
+        train_count, val_count, test_count = _split_counts(
+            total,
+            train_ratio,
+            val_ratio,
+            test_ratio,
+        )
+
+        if not stratify_by_difficulty or "difficulty_label" not in dataset.column_names:
+            indices = list(range(total))
+            rng.shuffle(indices)
+            train_indices = indices[:train_count]
+            val_indices = indices[train_count : train_count + val_count]
+            test_indices = indices[train_count + val_count :]
+        else:
+            buckets = self._build_class_indices(dataset, label_key="difficulty_label")
+            train_indices: list[int] = []
+            val_indices: list[int] = []
+            test_indices: list[int] = []
+            for label in ["easy", "medium", "hard"]:
+                label_indices = list(buckets.get(label, []))
+                rng.shuffle(label_indices)
+                n = len(label_indices)
+                l_train, l_val, _ = _split_counts(n, train_ratio, val_ratio, test_ratio)
+                train_indices.extend(label_indices[:l_train])
+                val_indices.extend(label_indices[l_train : l_train + l_val])
+                test_indices.extend(label_indices[l_train + l_val :])
+            rng.shuffle(train_indices)
+            rng.shuffle(val_indices)
+            rng.shuffle(test_indices)
+
+        split = datasets.DatasetDict(
+            {
+                "train": dataset.select(train_indices),
+                "validation": dataset.select(val_indices),
+                "test": dataset.select(test_indices),
+            }
+        )
+        self.logger.info(
+            "Split complete train=%s validation=%s test=%s",
+            len(split["train"]),
+            len(split["validation"]),
+            len(split["test"]),
+        )
+        return split
+
+    def create_curriculum_dataloader(
+        self,
+        dataset: Any,
+        *,
+        tokenizer: Any,
+        text_key: str = "text",
+        total_epochs: int = 5,
+        steps_per_epoch: int = 100,
+        batch_size: int = 2,
+        max_length: int = 128,
+        seed: int = 42,
+        schedule: CurriculumSchedule | None = None,
+        num_workers: int = 0,
+    ) -> Any:
+        """Create a dynamic curriculum DataLoader from a curated dataset split."""
+        torch = _import_torch_module()
+        if "difficulty_label" not in dataset.column_names:
+            raise ValueError(
+                "Dataset must include 'difficulty_label'. "
+                "Build it first with create_difficulty_dataset()."
+            )
+        if text_key not in dataset.column_names:
+            raise ValueError(f"Dataset is missing text column '{text_key}'.")
+
+        class_indices = self._build_class_indices(dataset, label_key="difficulty_label")
+        total_steps = max(1, total_epochs * steps_per_epoch)
+        use_schedule = schedule or CurriculumSchedule.default()
+
+        self.logger.info(
+            "Creating curriculum dataloader epochs=%s steps_per_epoch=%s total_steps=%s batch_size=%s",
+            total_epochs,
+            steps_per_epoch,
+            total_steps,
+            batch_size,
+        )
+        self.logger.info(
+            "Class bucket sizes easy=%s medium=%s hard=%s",
+            len(class_indices["easy"]),
+            len(class_indices["medium"]),
+            len(class_indices["hard"]),
+        )
+
+        iterable = CurriculumIterableDataset(
+            dataset=dataset,
+            tokenizer=tokenizer,
+            class_indices=class_indices,
+            text_key=text_key,
+            total_steps=total_steps,
+            max_length=max_length,
+            seed=seed,
+            schedule=use_schedule,
+        )
+        return torch.utils.data.DataLoader(
+            iterable,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            collate_fn=_collate_curriculum_batch,
+        )
+
+    def _build_class_indices(self, dataset: Any, *, label_key: str) -> dict[str, list[int]]:
+        buckets = {"easy": [], "medium": [], "hard": []}
+        for idx, label in enumerate(dataset[label_key]):
+            if label in buckets:
+                buckets[label].append(idx)
+        return buckets
+
 
 def _import_datasets_module() -> Any:
     """Import datasets lazily to keep import-time overhead low."""
@@ -537,3 +779,35 @@ def _move_batch_to_model_device(*, encoded: dict[str, Any], model: Any) -> dict[
         else:
             moved[key] = value
     return moved
+
+
+def _normalize_weights(weights: tuple[float, float, float]) -> tuple[float, float, float]:
+    total = weights[0] + weights[1] + weights[2]
+    if total <= 0:
+        return (1 / 3, 1 / 3, 1 / 3)
+    return (weights[0] / total, weights[1] / total, weights[2] / total)
+
+
+def _split_counts(
+    total: int, train_ratio: float, val_ratio: float, test_ratio: float
+) -> tuple[int, int, int]:
+    train_count = int(total * train_ratio)
+    val_count = int(total * val_ratio)
+    test_count = total - train_count - val_count
+    if test_count < 0:
+        test_count = 0
+    return train_count, val_count, test_count
+
+
+def _collate_curriculum_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    torch = _import_torch_module()
+    input_ids = torch.stack([item["input_ids"] for item in batch], dim=0)
+    attention_mask = torch.stack([item["attention_mask"] for item in batch], dim=0)
+    labels = input_ids.clone()
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+        "difficulty_label": [item["difficulty_label"] for item in batch],
+        "perplexity": [item["perplexity"] for item in batch],
+    }
