@@ -7,7 +7,9 @@ from dataclasses import dataclass
 import gc
 import logging
 import math
+from pathlib import Path
 import random
+import time
 from typing import Any
 
 import torch
@@ -330,9 +332,10 @@ class DataCurator:
         min_batch_size: int = 1,
         max_batch_size: int = 32,
         oom_backoff_factor: float = 0.5,
-        auto_grow_batch_size: bool = True,
-        growth_factor: float = 1.25,
-        growth_interval_successes: int = 3,
+        tune_for_throughput: bool = True,
+        tuning_interval_chunks: int = 5,
+        probe_scale_up: float = 1.2,
+        probe_scale_down: float = 0.85,
     ) -> Iterator[dict[str, Any]]:
         """Stream rows and compute perplexity per record.
 
@@ -356,10 +359,11 @@ class DataCurator:
             )
         )
         current_batch_size = max(min_batch_size, min(max_batch_size, current_batch_size))
-        success_streak = 0
+        chunk_counter = 0
+        last_throughput: float | None = None
 
         self.logger.info(
-            "Starting perplexity stream model_id=%s text_key=%s limit=%s max_length=%s medium_threshold=%.3f hard_threshold=%.3f batch_size=%s min_batch_size=%s max_batch_size=%s auto_grow=%s growth_factor=%.2f growth_interval=%s",
+            "Starting perplexity stream model_id=%s text_key=%s limit=%s max_length=%s medium_threshold=%.3f hard_threshold=%.3f batch_size=%s min_batch_size=%s max_batch_size=%s tune_for_throughput=%s",
             loaded_model.model_id,
             text_key,
             limit,
@@ -369,9 +373,7 @@ class DataCurator:
             current_batch_size,
             min_batch_size,
             max_batch_size,
-            auto_grow_batch_size,
-            growth_factor,
-            growth_interval_successes,
+            tune_for_throughput,
         )
 
         model.eval()
@@ -395,6 +397,7 @@ class DataCurator:
             if len(pending) < current_batch_size:
                 continue
             old_batch_size = current_batch_size
+            started = time.perf_counter()
             perplexities, current_batch_size = self._compute_perplexity_batch_with_backoff(
                 texts=[item[2] for item in pending],
                 model=model,
@@ -405,28 +408,26 @@ class DataCurator:
                 max_batch_size=max_batch_size,
                 oom_backoff_factor=oom_backoff_factor,
             )
-            if current_batch_size < old_batch_size:
-                success_streak = 0
-            else:
-                success_streak += 1
-                if (
-                    auto_grow_batch_size
-                    and current_batch_size < max_batch_size
-                    and success_streak >= max(1, growth_interval_successes)
-                ):
-                    next_batch_size = min(
-                        max_batch_size,
-                        max(current_batch_size + 1, int(current_batch_size * growth_factor)),
+            elapsed = max(1e-6, time.perf_counter() - started)
+            chunk_counter += 1
+            if tune_for_throughput:
+                current_throughput = len(perplexities) / elapsed
+                if last_throughput is None:
+                    last_throughput = current_throughput
+                elif chunk_counter % max(1, tuning_interval_chunks) == 0:
+                    current_batch_size = self._tune_batch_size_for_throughput(
+                        current_batch_size=current_batch_size,
+                        current_throughput=current_throughput,
+                        previous_throughput=last_throughput,
+                        min_batch_size=min_batch_size,
+                        max_batch_size=max_batch_size,
+                        probe_scale_up=probe_scale_up,
+                        probe_scale_down=probe_scale_down,
                     )
-                    if next_batch_size > current_batch_size:
-                        self.logger.info(
-                            "Increasing perplexity batch_size from %s to %s after %s stable chunk(s)",
-                            current_batch_size,
-                            next_batch_size,
-                            success_streak,
-                        )
-                        current_batch_size = next_batch_size
-                    success_streak = 0
+                    last_throughput = current_throughput
+
+            if current_batch_size < old_batch_size:
+                last_throughput = None
             for (p_index, p_row, p_text), perplexity in zip(pending, perplexities):
                 difficulty = self.difficulty_from_perplexity(
                     perplexity,
@@ -434,16 +435,8 @@ class DataCurator:
                     hard_threshold=hard_threshold,
                 )
                 processed += 1
-                # if processed % max(1, log_every) == 0:
-                    # self.logger.info(
-                    #     "Processed rows=%s latest_index=%s perplexity=%.4f difficulty=%s score=%.3f batch_size=%s",
-                    #     processed,
-                    #     p_index,
-                    #     perplexity,
-                    #     difficulty["label"],
-                    #     difficulty["score"],
-                    #     current_batch_size,
-                    # )
+                if processed % max(1, log_every) == 0:
+                    self.logger.info("Processed rows=%s", processed)
                 yield {
                     "index": p_index,
                     "text": p_text,
@@ -455,7 +448,6 @@ class DataCurator:
             pending = []
 
         if pending:
-            old_batch_size = current_batch_size
             perplexities, current_batch_size = self._compute_perplexity_batch_with_backoff(
                 texts=[item[2] for item in pending],
                 model=model,
@@ -466,10 +458,6 @@ class DataCurator:
                 max_batch_size=max_batch_size,
                 oom_backoff_factor=oom_backoff_factor,
             )
-            if current_batch_size < old_batch_size:
-                success_streak = 0
-            else:
-                success_streak += 1
             for (p_index, p_row, p_text), perplexity in zip(pending, perplexities):
                 difficulty = self.difficulty_from_perplexity(
                     perplexity,
@@ -603,6 +591,28 @@ class DataCurator:
             return min(max_batch_size, 16)
         return min(max_batch_size, 4)
 
+    def _tune_batch_size_for_throughput(
+        self,
+        *,
+        current_batch_size: int,
+        current_throughput: float,
+        previous_throughput: float,
+        min_batch_size: int,
+        max_batch_size: int,
+        probe_scale_up: float,
+        probe_scale_down: float,
+    ) -> int:
+        """Tune batch size to maximize records/sec instead of raw size."""
+        if current_throughput >= previous_throughput:
+            next_batch_size = max(
+                current_batch_size + 1,
+                int(current_batch_size * max(1.01, probe_scale_up)),
+            )
+            return min(max_batch_size, next_batch_size)
+
+        next_batch_size = int(current_batch_size * min(0.99, probe_scale_down))
+        return max(min_batch_size, min(current_batch_size - 1, next_batch_size))
+
     def difficulty_from_perplexity(
         self,
         perplexity: float,
@@ -660,9 +670,13 @@ class DataCurator:
         min_perplexity_batch_size: int = 1,
         max_perplexity_batch_size: int = 32,
         oom_backoff_factor: float = 0.5,
-        auto_grow_perplexity_batch_size: bool = True,
-        perplexity_growth_factor: float = 1.25,
-        perplexity_growth_interval_successes: int = 3,
+        tune_perplexity_for_throughput: bool = True,
+        perplexity_tuning_interval_chunks: int = 1,
+        perplexity_probe_scale_up: float = 1.2,
+        perplexity_probe_scale_down: float = 0.85,
+        spill_to_disk: bool = False,
+        spill_dir: str | None = None,
+        spill_chunk_size: int = 1000,
         unload_source_dataset: bool = True,
         unload_model_after: bool = False,
     ) -> Any:
@@ -673,15 +687,25 @@ class DataCurator:
         """
         datasets = _import_datasets_module()
         self.logger.info(
-            "Creating difficulty dataset text_key=%s limit=%s unload_source_dataset=%s unload_model_after=%s",
+            "Creating difficulty dataset text_key=%s limit=%s spill_to_disk=%s unload_source_dataset=%s unload_model_after=%s",
             text_key,
             limit,
+            spill_to_disk,
             unload_source_dataset,
             unload_model_after,
         )
 
         records: list[dict[str, Any]] = []
         class_counts = {"easy": 0, "medium": 0, "hard": 0}
+        shard_paths: list[Path] = []
+        if spill_to_disk:
+            if spill_chunk_size <= 0:
+                raise ValueError("spill_chunk_size must be > 0 when spill_to_disk=True.")
+            base_dir = Path(spill_dir or "outputs/curated_spill")
+            base_dir.mkdir(parents=True, exist_ok=True)
+            self.logger.info("Spilling curated shards to disk at %s", base_dir)
+        else:
+            base_dir = None
 
         for result in self.stream_perplexities(
             dataset,
@@ -698,9 +722,10 @@ class DataCurator:
             min_batch_size=min_perplexity_batch_size,
             max_batch_size=max_perplexity_batch_size,
             oom_backoff_factor=oom_backoff_factor,
-            auto_grow_batch_size=auto_grow_perplexity_batch_size,
-            growth_factor=perplexity_growth_factor,
-            growth_interval_successes=perplexity_growth_interval_successes,
+            tune_for_throughput=tune_perplexity_for_throughput,
+            tuning_interval_chunks=perplexity_tuning_interval_chunks,
+            probe_scale_up=perplexity_probe_scale_up,
+            probe_scale_down=perplexity_probe_scale_down,
         ):
             new_row = dict(result["record"])
             new_row["perplexity"] = result["perplexity"]
@@ -708,8 +733,20 @@ class DataCurator:
             new_row["difficulty_label"] = result["difficulty_label"]
             records.append(new_row)
             class_counts[result["difficulty_label"]] += 1
+            if spill_to_disk and len(records) >= spill_chunk_size:
+                shard_path = self._write_curated_shard(base_dir=base_dir, records=records, shard_index=len(shard_paths))
+                shard_paths.append(shard_path)
+                records.clear()
+                gc.collect()
 
-        curated = datasets.Dataset.from_list(records)
+        if spill_to_disk:
+            if records:
+                shard_path = self._write_curated_shard(base_dir=base_dir, records=records, shard_index=len(shard_paths))
+                shard_paths.append(shard_path)
+                records.clear()
+            curated = self._load_curated_from_shards(datasets=datasets, shard_paths=shard_paths)
+        else:
+            curated = datasets.Dataset.from_list(records)
         self.logger.info(
             "Created curated dataset rows=%s easy=%s medium=%s hard=%s",
             len(records),
@@ -724,6 +761,29 @@ class DataCurator:
             self.unload_model(loaded_model)
 
         return curated
+
+    def _write_curated_shard(
+        self,
+        *,
+        base_dir: Path | None,
+        records: list[dict[str, Any]],
+        shard_index: int,
+    ) -> Path:
+        """Write one curated shard to disk and return the shard path."""
+        if base_dir is None:
+            raise ValueError("base_dir must be set for shard writing.")
+        datasets = _import_datasets_module()
+        shard_path = base_dir / f"shard_{shard_index:06d}"
+        shard_dataset = datasets.Dataset.from_list(records)
+        shard_dataset.save_to_disk(str(shard_path))
+        return shard_path
+
+    def _load_curated_from_shards(self, *, datasets: Any, shard_paths: list[Path]) -> Any:
+        """Load all saved curated shards and concatenate into one dataset."""
+        if not shard_paths:
+            return datasets.Dataset.from_list([])
+        shards = [datasets.load_from_disk(str(path)) for path in shard_paths]
+        return datasets.concatenate_datasets(shards)
 
     def unload_dataset(self, dataset: Any | None) -> None:
         """Release references to a source dataset and trigger garbage collection."""

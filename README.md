@@ -91,7 +91,10 @@ curated = curator.create_difficulty_dataset(
     show_progress=True,
     perplexity_batch_size=None,      # auto-select by device memory
     max_perplexity_batch_size=32,    # upper bound for adaptive batching
-    auto_grow_perplexity_batch_size=True,  # probe upward after stable chunks
+    tune_perplexity_for_throughput=True,   # optimize for records/sec
+    spill_to_disk=True,                    # out-of-core mode for large datasets
+    spill_dir="outputs/curated_spill",
+    spill_chunk_size=500,
     unload_source_dataset=True,  # drop old dataset refs
     unload_model_after=True,     # optional model cleanup
 )
@@ -101,10 +104,11 @@ print(curated[0]["difficulty_label"], curated[0]["perplexity"])
 
 Perplexity speedup:
 - Adaptive batch scoring is enabled by default and automatically backs off batch size on OOM.
-- Batch size can also auto-grow after stable chunks to better use free memory.
+- Batch size is tuned for throughput (records/sec), not just maximum size.
 - Tune with `perplexity_batch_size`, `min_perplexity_batch_size`, `max_perplexity_batch_size`,
-  `auto_grow_perplexity_batch_size`, `perplexity_growth_factor`, and
-  `perplexity_growth_interval_successes`.
+  `tune_perplexity_for_throughput`, `perplexity_tuning_interval_chunks`,
+  `perplexity_probe_scale_up`, and `perplexity_probe_scale_down`.
+- For large corpora, use out-of-core spilling: `spill_to_disk=True` with `spill_chunk_size`.
 
 Split and curriculum sampling (library-managed):
 
