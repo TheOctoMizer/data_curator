@@ -679,13 +679,38 @@ class DataCurator:
         spill_chunk_size: int = 1000,
         unload_source_dataset: bool = True,
         unload_model_after: bool = False,
+        reuse_cached_curated: bool = False,
+        cached_curated_path: str | Path | None = None,
     ) -> Any:
         """Build a new dataset with perplexity and difficulty classes.
 
         Returns a Hugging Face ``datasets.Dataset`` with added columns:
         ``perplexity``, ``difficulty_score``, and ``difficulty_label``.
+
+        If ``reuse_cached_curated`` is True, loads a dataset previously saved with
+        ``Dataset.save_to_disk`` from ``cached_curated_path`` and skips scoring.
+        Defaults preserve existing behavior (always score from ``dataset``).
         """
         datasets = _import_datasets_module()
+        if reuse_cached_curated:
+            if cached_curated_path is None:
+                raise ValueError(
+                    "cached_curated_path is required when reuse_cached_curated=True."
+                )
+            cache_path = Path(cached_curated_path)
+            if not cache_path.exists():
+                raise FileNotFoundError(
+                    f"No curated dataset at {cache_path}. "
+                    "Save with Dataset.save_to_disk(...) or set reuse_cached_curated=False."
+                )
+            self.logger.info("Loading cached curated dataset from %s", cache_path)
+            curated = datasets.load_from_disk(str(cache_path))
+            if unload_source_dataset:
+                self.unload_dataset(dataset)
+            if unload_model_after:
+                self.unload_model(loaded_model)
+            return curated
+
         self.logger.info(
             "Creating difficulty dataset text_key=%s limit=%s spill_to_disk=%s unload_source_dataset=%s unload_model_after=%s",
             text_key,
@@ -749,7 +774,7 @@ class DataCurator:
             curated = datasets.Dataset.from_list(records)
         self.logger.info(
             "Created curated dataset rows=%s easy=%s medium=%s hard=%s",
-            len(records),
+            len(curated),
             class_counts["easy"],
             class_counts["medium"],
             class_counts["hard"],

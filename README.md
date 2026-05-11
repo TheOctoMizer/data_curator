@@ -102,6 +102,20 @@ curated = curator.create_difficulty_dataset(
 print(curated[0]["difficulty_label"], curated[0]["perplexity"])
 ```
 
+Reuse a curated dataset saved with Hugging Face ``save_to_disk`` (skips perplexity scoring):
+
+```python
+# After first run: curated.save_to_disk("outputs/my_curated")
+curated = curator.create_difficulty_dataset(
+    source,  # still passed; dropped if unload_source_dataset=True
+    loaded_model=loaded,
+    reuse_cached_curated=True,
+    cached_curated_path="outputs/my_curated",
+    unload_source_dataset=True,
+    unload_model_after=True,
+)
+```
+
 Perplexity speedup:
 - Adaptive batch scoring is enabled by default and automatically backs off batch size on OOM.
 - Batch size is tuned for throughput (records/sec), not just maximum size.
