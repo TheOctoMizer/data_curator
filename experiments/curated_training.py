@@ -1,6 +1,18 @@
-from datacurator import DataCurator
+"""Train GPT-2 on a curated dataset produced by curate_dataset.py.
+
+Run curation first:
+
+    python experiments/curate_dataset.py
+"""
+
+from __future__ import annotations
+
+import sys
 from pathlib import Path
 import shutil
+
+from datasets import load_from_disk
+from datacurator import DataCurator
 from transformers import (
     DataCollatorForLanguageModeling,
     GPT2LMHeadModel,
@@ -9,9 +21,20 @@ from transformers import (
     TrainingArguments,
 )
 
+# Must match CURATED_OUTPUT_DIR in curate_dataset.py
+CURATED_DATASET_DIR = Path("outputs/curated_wikitext_train")
+
 
 def main() -> None:
-    """Train GPT-2 on curated data prepared by DataCurator."""
+    """Train GPT-2 on curated data loaded from disk."""
+    if not CURATED_DATASET_DIR.exists():
+        print(
+            f"Missing curated dataset at {CURATED_DATASET_DIR.resolve()}. "
+            "Run first:\n  python experiments/curate_dataset.py",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     model_name = "gpt2"
     block_size = 128
     batch_size = 4
@@ -20,30 +43,12 @@ def main() -> None:
     seed = 42
     output_dir = Path("outputs/curated-gpt2")
 
+    print(f"Loading curated dataset from {CURATED_DATASET_DIR.resolve()}...")
+    curated_dataset = load_from_disk(str(CURATED_DATASET_DIR))
+    print(f"Curated dataset size: {len(curated_dataset)}")
+
     datacurator = DataCurator()
     print(datacurator.describe())
-    loaded = datacurator.load_model()  # used for perplexity-based curation
-    print(loaded.model_id, loaded.device, loaded.quantization)
-    source_dataset = datacurator.stream_dataset(
-        "wikitext",
-        config="wikitext-2-raw-v1",
-        split="train",
-    )
-
-    print("Creating curated dataset with difficulty labels...")
-    curated_dataset = datacurator.create_difficulty_dataset(
-        source_dataset,
-        loaded_model=loaded,
-        text_key="text",
-        limit=None,
-        show_progress=True,
-        spill_to_disk=True,
-        spill_dir="outputs/curated_spill",
-        spill_chunk_size=500,
-        unload_source_dataset=True,
-        unload_model_after=True,
-    )
-    print(f"Curated dataset size: {len(curated_dataset)}")
 
     print("Creating train/validation/test split...")
     splits = datacurator.split_dataset(

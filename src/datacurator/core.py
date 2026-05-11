@@ -681,6 +681,8 @@ class DataCurator:
         unload_model_after: bool = False,
         reuse_cached_curated: bool = False,
         cached_curated_path: str | Path | None = None,
+        reuse_spill_shards: bool = False,
+        spill_shards_dir: str | Path | None = None,
     ) -> Any:
         """Build a new dataset with perplexity and difficulty classes.
 
@@ -689,9 +691,30 @@ class DataCurator:
 
         If ``reuse_cached_curated`` is True, loads a dataset previously saved with
         ``Dataset.save_to_disk`` from ``cached_curated_path`` and skips scoring.
+
+        If ``reuse_spill_shards`` is True, loads ``shard_*`` subdirectories under
+        ``spill_shards_dir`` (same layout as ``spill_to_disk``) and skips scoring.
+
         Defaults preserve existing behavior (always score from ``dataset``).
         """
         datasets = _import_datasets_module()
+        if reuse_cached_curated and reuse_spill_shards:
+            raise ValueError(
+                "Use only one of reuse_cached_curated or reuse_spill_shards, not both."
+            )
+        if reuse_spill_shards:
+            if spill_shards_dir is None:
+                raise ValueError(
+                    "spill_shards_dir is required when reuse_spill_shards=True."
+                )
+            self.logger.info("Reusing spill shards from %s", spill_shards_dir)
+            curated = self.load_curated_from_spill_dir(spill_shards_dir)
+            if unload_source_dataset:
+                self.unload_dataset(dataset)
+            if unload_model_after:
+                self.unload_model(loaded_model)
+            return curated
+
         if reuse_cached_curated:
             if cached_curated_path is None:
                 raise ValueError(
@@ -809,6 +832,28 @@ class DataCurator:
             return datasets.Dataset.from_list([])
         shards = [datasets.load_from_disk(str(path)) for path in shard_paths]
         return datasets.concatenate_datasets(shards)
+
+    def load_curated_from_spill_dir(self, spill_dir: str | Path) -> Any:
+        """Load a curated dataset from a prior ``spill_to_disk`` directory.
+
+        Expects child directories named ``shard_000000``, ``shard_000001``, …
+        as produced when writing shards under ``spill_dir``.
+        """
+        datasets = _import_datasets_module()
+        root = Path(spill_dir)
+        if not root.is_dir():
+            raise FileNotFoundError(f"Spill directory not found: {root}")
+        shard_paths = sorted(
+            p for p in root.iterdir() if p.is_dir() and p.name.startswith("shard_")
+        )
+        if not shard_paths:
+            raise FileNotFoundError(
+                f"No shard_* subdirectories under {root}. "
+                "Run curation with spill_to_disk=True first, or pass the spill root "
+                "that contains shard_* folders."
+            )
+        self.logger.info("Loading %s spill shards from %s", len(shard_paths), root)
+        return self._load_curated_from_shards(datasets=datasets, shard_paths=shard_paths)
 
     def unload_dataset(self, dataset: Any | None) -> None:
         """Release references to a source dataset and trigger garbage collection."""

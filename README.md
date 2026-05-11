@@ -116,6 +116,14 @@ curated = curator.create_difficulty_dataset(
 )
 ```
 
+Reuse spill shards from an earlier ``spill_to_disk`` run (``shard_*`` folders under ``spill_dir``):
+
+```python
+curated = curator.load_curated_from_spill_dir("outputs/curated_spill")
+```
+
+You can also pass ``reuse_spill_shards=True`` and ``spill_shards_dir=...`` into ``create_difficulty_dataset`` if you prefer the same call site as a full curation run.
+
 Perplexity speedup:
 - Adaptive batch scoring is enabled by default and automatically backs off batch size on OOM.
 - Batch size is tuned for throughput (records/sec), not just maximum size.
@@ -154,3 +162,21 @@ dataloader = curator.create_curriculum_dataloader(
     schedule=CurriculumSchedule.default(),
 )
 ```
+
+## Experiments (curate then train)
+
+Curation is heavy (loads the scorer model and scores every row). The experiment scripts split that work from training:
+
+1. **Curate and save** (writes `outputs/curated_wikitext_train`):
+
+   ```bash
+   python experiments/curate_dataset.py
+   ```
+
+2. **Train on the saved dataset** (loads from disk, no scoring):
+
+   ```bash
+   python experiments/curated_training.py
+   ```
+
+The output path is shared between the two scripts; change both if you use a different location.
