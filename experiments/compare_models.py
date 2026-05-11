@@ -9,6 +9,14 @@ from datasets import load_dataset
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 
 
+# Checkpoints produced by experiments/*.py (run from repo root).
+MODEL_CHECKPOINTS: list[tuple[str, Path]] = [
+    ("Non-curated", Path("outputs/noncurated-gpt2/final")),
+    ("Curated", Path("outputs/curated-gpt2/final")),
+    ("Curriculum", Path("outputs/curated-curriculum-gpt2/final")),
+]
+
+
 def _select_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
@@ -107,10 +115,16 @@ def _evaluate_model_with_timing(
         total_sec = sum(batch_times_ms) / 1000.0
         timing["eval_tokens_per_sec"] = total_tokens_timed / max(total_sec, 1e-6)
 
+    del model
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    elif device == "mps" and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+
     return avg_loss, ppl, timing
 
 
-def _strip_helpers(s: str, max_len: int = 280) -> str:
+def _strip_helpers(s: str, max_len: int = 220) -> str:
     s = s.replace("\n", " ").strip()
     return s[:max_len] + ("…" if len(s) > max_len else "")
 
@@ -175,13 +189,16 @@ def _generate_sample(
 
 def main() -> None:
     """Compare checkpoints: eval loss, throughput, and greedy generations."""
-    noncurated_model_dir = Path("outputs/noncurated-gpt2/final")
-    curated_model_dir = Path("outputs/curated-gpt2/final")
-
-    if not noncurated_model_dir.exists():
-        raise FileNotFoundError(f"Missing model dir: {noncurated_model_dir}")
-    if not curated_model_dir.exists():
-        raise FileNotFoundError(f"Missing model dir: {curated_model_dir}")
+    missing = [path for _, path in MODEL_CHECKPOINTS if not path.exists()]
+    if missing:
+        lines = "\n".join(f"  - {p}" for p in missing)
+        raise FileNotFoundError(
+            "Missing checkpoint directory(ies). Train first, then re-run:\n"
+            f"{lines}\n"
+            "  noncurated: experiments/noncurated_training.py\n"
+            "  curated: experiments/curated_training.py (after curate_dataset.py)\n"
+            "  curriculum: experiments/curated_curriculum_training.py (after curate_dataset.py)"
+        )
 
     block_size = 128
     max_eval_samples = 512
@@ -197,100 +214,87 @@ def main() -> None:
         max_eval_samples=max_eval_samples,
         block_size=block_size,
     )
-    print(f"Evaluating on {len(eval_dataset)} test records (same split for both models).\n")
+    n_models = len(MODEL_CHECKPOINTS)
+    print(
+        f"Evaluating on {len(eval_dataset)} test records (same split for all {n_models} models).\n"
+    )
 
     print("--- Teacher-forcing eval (loss on padded wikitext test batches) ---")
-    nc_loss, nc_ppl, nc_time = _evaluate_model_with_timing(
-        model_dir=noncurated_model_dir,
-        eval_dataset=eval_dataset,
-        batch_size=eval_batch_size,
-        device=device,
-    )
-    cu_loss, cu_ppl, cu_time = _evaluate_model_with_timing(
-        model_dir=curated_model_dir,
-        eval_dataset=eval_dataset,
-        batch_size=eval_batch_size,
-        device=device,
-    )
-
-    print(f"Non-curated  | loss={nc_loss:.4f} | ppl={nc_ppl:.4f}")
-    if nc_time:
-        print(
-            f"             | eval ~{nc_time['eval_ms_per_batch_mean']:.1f} ms/batch | "
-            f"~{nc_time['eval_tokens_per_sec']:.0f} tokens/s (post-warmup)"
+    label_width = max(len(name) for name, _ in MODEL_CHECKPOINTS)
+    eval_rows: list[tuple[str, float, float, dict[str, float]]] = []
+    for label, model_dir in MODEL_CHECKPOINTS:
+        loss, ppl, timing = _evaluate_model_with_timing(
+            model_dir=model_dir,
+            eval_dataset=eval_dataset,
+            batch_size=eval_batch_size,
+            device=device,
         )
-    print(f"Curated      | loss={cu_loss:.4f} | ppl={cu_ppl:.4f}")
-    if cu_time:
-        print(
-            f"             | eval ~{cu_time['eval_ms_per_batch_mean']:.1f} ms/batch | "
-            f"~{cu_time['eval_tokens_per_sec']:.0f} tokens/s (post-warmup)"
-        )
+        eval_rows.append((label, loss, ppl, timing))
+        print(f"{label:<{label_width}} | loss={loss:.4f} | ppl={ppl:.4f}")
+        if timing:
+            print(
+                f"{' ' * label_width} | eval ~{timing['eval_ms_per_batch_mean']:.1f} ms/batch | "
+                f"~{timing['eval_tokens_per_sec']:.0f} tokens/s (post-warmup)"
+            )
 
     print("\n=== Interpretation ===")
     print(
         "Lower loss here means better next-token prediction on these fixed-length padded batches. "
-        "If one run used many more steps or different data, loss is not a fair single number for 'which pipeline is better'."
+        "If one run used many more steps or different training data, loss is not a fair single number "
+        "for 'which pipeline is better'."
     )
-    if nc_ppl > 100 and cu_ppl < 50:
+    nc_ppl = next((ppl for lab, _, ppl, _ in eval_rows if lab == "Non-curated"), float("nan"))
+    if math.isfinite(nc_ppl) and nc_ppl > 100:
         print(
             "Note: Very high non-curated perplexity often means that checkpoint did not train long enough, "
             "failed to save correctly, or does not match this tokenizer/setup."
         )
 
-    winner = None
-    if math.isfinite(cu_ppl) and math.isfinite(nc_ppl):
-        if cu_ppl < nc_ppl:
-            winner = "curated"
-        elif nc_ppl < cu_ppl:
-            winner = "non-curated"
+    winner: str | None = None
+    best_ppl = float("inf")
+    for label, _, ppl, _ in eval_rows:
+        if math.isfinite(ppl) and ppl < best_ppl:
+            best_ppl = ppl
+            winner = label
     print("\n=== Winner on eval loss (use with caution) ===")
-    if winner == "curated":
-        print("Curated checkpoint has lower perplexity on this eval.")
-    elif winner == "non-curated":
-        print("Non-curated checkpoint has lower perplexity on this eval.")
+    if winner is not None:
+        print(f"{winner} checkpoint has the lowest perplexity on this eval (~{best_ppl:.4f}).")
     else:
         print("Could not pick a winner (check for inf/overflow in loss).")
 
     print("\n--- Greedy generation (same prompts, max_new_tokens=80) ---")
+    gen_label_width = max(len(name) for name, _ in MODEL_CHECKPOINTS)
     prompts = [
         "The history of Rome begins with",
         "In machine learning, perplexity measures",
         "Scientists discovered that",
     ]
 
-    nc_model = GPT2LMHeadModel.from_pretrained(str(noncurated_model_dir)).to(device).eval()
-    cu_model = GPT2LMHeadModel.from_pretrained(str(curated_model_dir)).to(device).eval()
+    loaded: list[tuple[str, GPT2LMHeadModel]] = []
+    for label, model_dir in MODEL_CHECKPOINTS:
+        m = GPT2LMHeadModel.from_pretrained(str(model_dir)).to(device).eval()
+        loaded.append((label, m))
 
     for i, prompt in enumerate(prompts):
         print(f"\n>>> Prompt {i + 1}: {prompt!r}")
-        nc_text, nc_gen = _generate_sample(
-            model=nc_model,
-            tokenizer=tokenizer,
-            device=device,
-            prompt=prompt,
-            max_new_tokens=80,
-            do_warmup=(i == 0),
-        )
-        cu_text, cu_gen = _generate_sample(
-            model=cu_model,
-            tokenizer=tokenizer,
-            device=device,
-            prompt=prompt,
-            max_new_tokens=80,
-            do_warmup=(i == 0),
-        )
-        print(f"  Non-curated: {_strip_helpers(nc_text)}")
-        print(
-            f"               [gen {int(nc_gen['gen_new_tokens'])} tok in {nc_gen['gen_latency_sec']*1000:.1f} ms, "
-            f"~{nc_gen['gen_tokens_per_sec']:.1f} tok/s]"
-        )
-        print(f"  Curated:     {_strip_helpers(cu_text)}")
-        print(
-            f"               [gen {int(cu_gen['gen_new_tokens'])} tok in {cu_gen['gen_latency_sec']*1000:.1f} ms, "
-            f"~{cu_gen['gen_tokens_per_sec']:.1f} tok/s]"
-        )
+        for j, (label, model) in enumerate(loaded):
+            text, gen = _generate_sample(
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                prompt=prompt,
+                max_new_tokens=80,
+                do_warmup=(i == 0 and j == 0),
+            )
+            print(f"  {label:<{gen_label_width}}: {_strip_helpers(text)}")
+            print(
+                f"  {' ' * gen_label_width}  [gen {int(gen['gen_new_tokens'])} tok in "
+                f"{gen['gen_latency_sec'] * 1000:.1f} ms, ~{gen['gen_tokens_per_sec']:.1f} tok/s]"
+            )
 
-    del nc_model, cu_model
+    for _, model in loaded:
+        del model
+    loaded.clear()
     if device == "cuda":
         torch.cuda.empty_cache()
     elif device == "mps" and hasattr(torch.mps, "empty_cache"):
