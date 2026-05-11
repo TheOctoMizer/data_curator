@@ -1181,19 +1181,32 @@ def _split_counts(
 
 
 def curriculum_lm_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate curriculum samples for causal LM training (e.g. Hugging Face ``Trainer``).
+    """Collate curriculum or map-style HF batches for causal LM training (e.g. ``Trainer``).
 
-    Sets ``labels`` to ``-100`` on padded positions (``attention_mask == 0``) so loss
-    ignores padding, matching :class:`transformers.DataCollatorForLanguageModeling`
-    behavior for CLM.
+    Accepts ``input_ids`` / ``attention_mask`` as ``torch.Tensor`` (curriculum iterable)
+    or as lists / NumPy arrays (typical ``datasets`` map batches). Sets ``labels`` to
+    ``-100`` where ``attention_mask == 0`` so padding is ignored in the loss.
     """
     return _collate_curriculum_batch(batch)
 
 
+def _rows_to_long_tensor(torch: Any, rows: list[Any]) -> Any:
+    """Stack one row per batch element into a single ``long`` tensor."""
+    tensors = []
+    for row in rows:
+        if isinstance(row, torch.Tensor):
+            tensors.append(row.long())
+        else:
+            tensors.append(torch.as_tensor(row, dtype=torch.long))
+    return torch.stack(tensors, dim=0)
+
+
 def _collate_curriculum_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     torch = _import_torch_module()
-    input_ids = torch.stack([item["input_ids"] for item in batch], dim=0)
-    attention_mask = torch.stack([item["attention_mask"] for item in batch], dim=0)
+    input_ids = _rows_to_long_tensor(torch, [item["input_ids"] for item in batch])
+    attention_mask = _rows_to_long_tensor(
+        torch, [item["attention_mask"] for item in batch]
+    )
     labels = input_ids.clone()
     labels = labels.masked_fill(attention_mask == 0, -100)
     return {
