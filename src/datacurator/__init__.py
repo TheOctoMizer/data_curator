@@ -1,5 +1,17 @@
 """DataCurator package."""
 
-from .core import CurriculumSchedule, DataCurator, LoadedModel
+from .core import (
+    CurriculumIterableDataset,
+    CurriculumSchedule,
+    DataCurator,
+    LoadedModel,
+    curriculum_lm_collate_fn,
+)
 
-__all__ = ["DataCurator", "LoadedModel", "CurriculumSchedule"]
+__all__ = [
+    "CurriculumIterableDataset",
+    "CurriculumSchedule",
+    "DataCurator",
+    "LoadedModel",
+    "curriculum_lm_collate_fn",
+]

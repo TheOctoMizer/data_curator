@@ -179,4 +179,10 @@ Curation is heavy (loads the scorer model and scores every row). The experiment 
    python experiments/curated_training.py
    ```
 
-The output path is shared between the two scripts; change both if you use a different location.
+3. **Optional — curriculum training** (same disk dataset; train split is sampled easy→hard over progress via ``CurriculumSchedule``):
+
+   ```bash
+   python experiments/curated_curriculum_training.py
+   ```
+
+The curated output path is shared by ``curate_dataset.py`` and the training scripts; change it in each file if you relocate the dataset.

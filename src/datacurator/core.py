@@ -1021,6 +1021,64 @@ class DataCurator:
             collate_fn=_collate_curriculum_batch,
         )
 
+    def build_curriculum_iterable_dataset(
+        self,
+        dataset: Any,
+        *,
+        tokenizer: Any,
+        text_key: str = "text",
+        total_epochs: int = 5,
+        steps_per_epoch: int = 100,
+        max_length: int = 128,
+        seed: int = 42,
+        schedule: CurriculumSchedule | None = None,
+    ) -> CurriculumIterableDataset:
+        """Build a :class:`CurriculumIterableDataset` for use with Hugging Face ``Trainer``.
+
+        Each call to ``__iter__`` yields ``total_epochs * steps_per_epoch`` samples, drawing
+        rows by difficulty with weights from ``schedule`` (default: easy → hard over progress).
+
+        Pair with :func:`curriculum_lm_collate_fn` as ``data_collator`` and set
+        ``TrainingArguments(max_steps=...)`` so one training run consumes the iterator
+        (typically ``ceil((total_epochs * steps_per_epoch) / per_device_train_batch_size)``).
+        """
+        if "difficulty_label" not in dataset.column_names:
+            raise ValueError(
+                "Dataset must include 'difficulty_label'. "
+                "Build it first with create_difficulty_dataset()."
+            )
+        if text_key not in dataset.column_names:
+            raise ValueError(f"Dataset is missing text column '{text_key}'.")
+
+        class_indices = self._build_class_indices(dataset, label_key="difficulty_label")
+        total_steps = max(1, total_epochs * steps_per_epoch)
+        use_schedule = schedule or CurriculumSchedule.default()
+
+        self.logger.info(
+            "Building curriculum iterable dataset epochs=%s steps_per_epoch=%s total_samples=%s max_length=%s",
+            total_epochs,
+            steps_per_epoch,
+            total_steps,
+            max_length,
+        )
+        self.logger.info(
+            "Class bucket sizes easy=%s medium=%s hard=%s",
+            len(class_indices["easy"]),
+            len(class_indices["medium"]),
+            len(class_indices["hard"]),
+        )
+
+        return CurriculumIterableDataset(
+            dataset=dataset,
+            tokenizer=tokenizer,
+            class_indices=class_indices,
+            text_key=text_key,
+            total_steps=total_steps,
+            max_length=max_length,
+            seed=seed,
+            schedule=use_schedule,
+        )
+
     def _build_class_indices(self, dataset: Any, *, label_key: str) -> dict[str, list[int]]:
         buckets = {"easy": [], "medium": [], "hard": []}
         for idx, label in enumerate(dataset[label_key]):
@@ -1122,17 +1180,26 @@ def _split_counts(
     return train_count, val_count, test_count
 
 
+def curriculum_lm_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate curriculum samples for causal LM training (e.g. Hugging Face ``Trainer``).
+
+    Sets ``labels`` to ``-100`` on padded positions (``attention_mask == 0``) so loss
+    ignores padding, matching :class:`transformers.DataCollatorForLanguageModeling`
+    behavior for CLM.
+    """
+    return _collate_curriculum_batch(batch)
+
+
 def _collate_curriculum_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     torch = _import_torch_module()
     input_ids = torch.stack([item["input_ids"] for item in batch], dim=0)
     attention_mask = torch.stack([item["attention_mask"] for item in batch], dim=0)
     labels = input_ids.clone()
+    labels = labels.masked_fill(attention_mask == 0, -100)
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
-        "difficulty_label": [item["difficulty_label"] for item in batch],
-        "perplexity": [item["perplexity"] for item in batch],
     }
 
 
